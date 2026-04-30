@@ -165,6 +165,7 @@ PRIORITISE:
 - Captions where a person's name is split across two captions
 - Caption breaks that fall mid-phrase or mid-thought when the audio has a natural pause elsewhere
 - Captions that combine end-of-one-thought + start-of-another (should split)
+- Single-word captions that feel abrupt (should be merged)
 
 CRITICAL RULES FOR MOVING TEXT:
 1. If you move words from one caption to another, you MUST return an update for BOTH captions to prevent duplicating text!
@@ -220,6 +221,9 @@ For these, effective_max_chars = 60 - length of the name tag line.
 If a caption has line_too_long: true, the current text overflows — you MUST suggest a redistribution of words with neighbouring captions so the spoken text fits within effective_max_chars total characters.
 Write new_text as a flat string with NO line breaks — the formatter will split it automatically.
 
+SINGLE WORD RULE:
+Avoid captions that contain only a single word unless it is a significant exclamation or the start of a new speaker. Merge single-word captions into the preceding or following caption to maintain flow, provided it doesn't violate line length or italic rules.
+
 INPUT CAPTIONS:
 ${JSON.stringify(captions.map(c => {
   const NAME_TAG_RE = /^([A-Z][A-Z\s.\-']{1,40}:)/;
@@ -231,7 +235,8 @@ ${JSON.stringify(captions.map(c => {
   const spokenLines = nameTagMatch ? lines.slice(1) : lines;
   const lineTooLong = spokenLines.some(l => l.trim().length > 30);
   // Only send timing flags that represent real problems Gemini must address.
-  // "Timing adjusted — …" flags are auto-handled by Stage 1 and don't need AI attention.
+  // "Timing adjusted — …" flags indicate Stage 1 already modified timing and don't need AI to rewrite text,
+  // but they DO need WhisperX retiming (handled separately).
   const realTimingFlag = c.timingFlag && c.timingFlag.startsWith('Timing needs') ? c.timingFlag : null;
   const entry = {
     index: c.index,
@@ -253,7 +258,7 @@ ${JSON.stringify(captions.map(c => {
             { text: geminiPrompt }
           ]
         }],
-        generationConfig: { temperature: 0.2 }
+        generationConfig: { temperature: 0.2, maxOutputTokens: 32768 }
       };
 
       // Try models in order, falling back on 503/UNAVAILABLE
@@ -286,7 +291,38 @@ ${JSON.stringify(captions.map(c => {
         const responseText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
         console.log('Gemini response (first 500 chars):', responseText.substring(0, 500));
         const jsonMatch = responseText.match(/\[[\s\S]*\]/);
-        suggestions = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(responseText);
+        try {
+          suggestions = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(responseText);
+        } catch (parseErr) {
+          // Salvage: response was likely truncated. Extract complete top-level
+          // {...} objects by tracking brace depth, ignoring braces inside strings.
+          const finishReason = geminiData.candidates?.[0]?.finishReason;
+          console.warn(`[/api/refine] Primary parse failed (${parseErr.message}). FinishReason: ${finishReason}. Attempting salvage...`);
+          
+          const salvaged = [];
+          const src = responseText;
+          let depth = 0, start = -1, inStr = false, esc = false;
+          for (let i = 0; i < src.length; i++) {
+            const ch = src[i];
+            if (inStr) {
+              if (esc) { esc = false; continue; }
+              if (ch === '\\') { esc = true; continue; }
+              if (ch === '"') inStr = false;
+              continue;
+            }
+            if (ch === '"') { inStr = true; continue; }
+            if (ch === '{') { if (depth === 0) start = i; depth++; }
+            else if (ch === '}') {
+              depth--;
+              if (depth === 0 && start !== -1) {
+                try { salvaged.push(JSON.parse(src.slice(start, i + 1))); } catch (_) {}
+                start = -1;
+              }
+            }
+          }
+          suggestions = salvaged;
+          console.log(`[/api/refine] Salvaged ${salvaged.length} suggestions from incomplete response.`);
+        }
       } catch (e) {
         console.warn(`Could not parse Gemini suggestions: ${e.message}`);
         suggestions = [];
