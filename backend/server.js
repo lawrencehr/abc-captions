@@ -2,6 +2,7 @@ const express = require('express');
 const fileUpload = require('express-fileupload');
 const fs = require('fs');
 const path = require('path');
+const { matchCaptionsToTranscript } = require('./lib/matcher');
 const app = express();
 
 // File upload configuration
@@ -136,6 +137,10 @@ app.post('/api/refine', async (req, res) => {
 
     const audioFile = req.files.audio;
     const audioBuffer = fs.readFileSync(audioFile.tempFilePath);
+    // Delete temp file immediately — buffer is in memory, disk copy no longer needed
+    fs.unlink(audioFile.tempFilePath, err => {
+      if (err) console.error('[cleanup] Failed to delete temp file:', err.message);
+    });
     const audioBase64 = audioBuffer.toString('base64');
     const audioFormat = audioFile.mimetype.includes('mp3') ? 'mp3' :
                         audioFile.mimetype.includes('wav') ? 'wav' : 'm4a';
@@ -168,6 +173,7 @@ You MUST NOT edit, rephrase, or omit any words from the original captions. Your 
 
 PRIORITISE:
 - Captions flagged with "⚠" — these are known to have timing issues
+- Abnormally short captions (e.g. 1-2 words) — merge these with neighbors to improve flow unless they are name tags or represent significant dramatic pauses.
 - Captions where a person's name is split across two captions
 - Caption breaks that fall mid-phrase or mid-thought when the audio has a natural pause elsewhere
 - Captions that combine end-of-one-thought + start-of-another (should split)
@@ -216,27 +222,33 @@ INPUT CAPTIONS:
 ${JSON.stringify(captions.map(c => {
   const NAME_TAG_RE = /^([A-Z][A-Z\s.\-']{1,40}:)/;
   const lines = c.text ? c.text.split('\n') : [];
-  const nameTagMatch = lines[0] && NAME_TAG_RE.test(lines[0].trim());
-  const nameTagLen = nameTagMatch ? lines[0].trim().length : 0;
-  const effectiveMax = nameTagMatch ? 60 - nameTagLen : 60;
-  // Check if any spoken line (skip name tag line) exceeds 30 chars
-  const spokenLines = nameTagMatch ? lines.slice(1) : lines;
-  const lineTooLong = spokenLines.some(l => l.trim().length > 30);
-  // Only send timing flags that represent real problems Gemini must address.
-  // "Timing adjusted — …" flags indicate Stage 1 already modified timing and don't need AI to rewrite text,
-  // but they DO need WhisperX retiming (handled separately).
-  const realTimingFlag = c.timingFlag && c.timingFlag.startsWith('Timing needs') ? c.timingFlag : null;
-  const entry = {
-    index: c.index,
-    text: c.text,
-    italic: c.italic,
-    ...(realTimingFlag ? { timing_flag: realTimingFlag } : {}),
-  };
-  if (lineTooLong) {
-    entry.line_too_long = true;
-    entry.effective_max_chars = effectiveMax;
-  }
-  return entry;
+  const nameTagMatch = lines.length > 0 && NAME_TAG_RE.test(lines[0]);
+    // Word count check for "short" captions (excluding tags and name tags)
+    const cleanTextForShortCheck = (c.text || '')
+      .replace(/<[^>]*>/g, '')         // Strip ALL tags
+      .replace(NAME_TAG_RE, '')        // Strip speaker label
+      .trim();
+    const wordCount = cleanTextForShortCheck ? cleanTextForShortCheck.split(/\s+/).length : 0;
+    const isShort = wordCount > 0 && wordCount <= 2 && !nameTagMatch;
+
+    // Check if any spoken line (skip name tag line) exceeds 30 chars
+    const spokenLines = nameTagMatch ? lines.slice(1) : lines;
+    const lineTooLong = spokenLines.some(l => l.trim().length > 30);
+    
+    const realTimingFlag = c.timingFlag && c.timingFlag.startsWith('Timing needs') ? c.timingFlag : null;
+    const effectiveMax = nameTagMatch ? Math.max(10, 60 - lines[0].length) : 60;
+    const entry = {
+      index: c.index,
+      text: c.text,
+      italic: c.italic,
+      ...(realTimingFlag ? { timing_flag: realTimingFlag } : {}),
+      ...(isShort ? { is_short: true } : {}),
+    };
+    if (lineTooLong) {
+      entry.line_too_long = true;
+      entry.effective_max_chars = effectiveMax;
+    }
+    return entry;
 }), null, 2)}`;
 
       const geminiBody = {
@@ -256,7 +268,7 @@ ${JSON.stringify(captions.map(c => {
       };
 
       // Try models in order, falling back on 503/UNAVAILABLE
-      const geminiModels = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+      const geminiModels = ['gemini-2.5-flash', 'gemini-2.0-flash'];
       let geminiResponse, geminiData;
       for (let attempt = 0; attempt < geminiModels.length; attempt++) {
         const model = geminiModels[attempt];
@@ -270,11 +282,16 @@ ${JSON.stringify(captions.map(c => {
         if (geminiResponse.ok) break;
         const errBody = await geminiResponse.json();
         console.error(`Gemini ${model} attempt ${attempt} failed: ${errBody?.error?.status}`);
+        console.error("Gemini Error Body:", JSON.stringify(errBody, null, 2));
         if (errBody?.error?.status !== 'UNAVAILABLE' && errBody?.error?.status !== 'RESOURCE_EXHAUSTED') {
-          return res.status(500).json({ status: 'error', error: `Gemini API error: ${errBody?.error?.message || geminiResponse.statusText}` });
+          clearInterval(keepAlive);
+          res.write(JSON.stringify({ status: 'error', error: `Gemini API error: ${errBody?.error?.message || geminiResponse.statusText}` }));
+          return res.end();
         }
         if (attempt === geminiModels.length - 1) {
-          return res.status(503).json({ status: 'error', error: 'Gemini is overloaded — please try again in a minute.' });
+          clearInterval(keepAlive);
+          res.write(JSON.stringify({ status: 'error', error: 'Gemini is overloaded — please try again in a minute.' }));
+          return res.end();
         }
       }
 
@@ -341,97 +358,6 @@ ${JSON.stringify(captions.map(c => {
 
     console.log(`[/api/refine] Phase 2: WhisperX for ${captions.length} captions, ${acceptedSuggestions.length} accepted changes`);
 
-    const suggestionsMap = new Map(acceptedSuggestions.map(s => [s.caption_index, s]));
-    const isChangedSet = new Set(acceptedSuggestions.map(s => s.caption_index));
-    // Also mark captions with "Timing needs" flags for alignment (even without suggestions)
-    for (const cap of captions) {
-      if (cap.timingFlag && (cap.timingFlag.includes('Timing needs') || cap.timingFlag.includes('Line too long'))) {
-        isChangedSet.add(cap.index);
-      }
-    }
-    const BOUNDARY_BUFFER_MS = 300;
-
-    const resolveText = (cap, suggestion) => {
-      if (!suggestion) return cap.text;
-      const isDelete = suggestion.change_type === 'delete' ||
-        suggestion.new_text === null ||
-        suggestion.new_text === undefined ||
-        (typeof suggestion.new_text === 'string' && suggestion.new_text.trim() === '');
-      return isDelete ? '' : suggestion.new_text;
-    };
-
-    const tokenize = text =>
-      (text || '').toLowerCase().replace(/[^\w\s]/g, ' ').trim().split(/\s+/).filter(t => t.length > 0);
-
-    // Group consecutive changed/timing-flagged captions into chains.
-    const chainStart = new Array(captions.length).fill(-1);
-    const chainEnd = new Array(captions.length).fill(-1);
-    let ci = 0;
-    while (ci < captions.length) {
-      if (!isChangedSet.has(captions[ci].index)) { ci++; continue; }
-      const start = ci;
-      while (ci < captions.length && isChangedSet.has(captions[ci].index)) {
-        chainStart[ci] = start;
-        ci++;
-      }
-      const end = ci - 1;
-      for (let k = start; k <= end; k++) chainEnd[k] = end;
-    }
-
-    // Build ONE WhisperX segment per chain (concatenated text, chain outer window).
-    // WhisperX returns word-level timestamps for the whole chain; we then walk
-    // words by token count to assign per-caption timing — no internal boundary
-    // confusion because we never ask WhisperX to split the chain itself.
-    const chainTextMap = new Map(); // headArrayIdx → chain metadata
-    const processedChainHeads = new Set();
-    let chainArrayIdx = 0;
-
-    for (let idx = 0; idx < captions.length; idx++) {
-      if (!isChangedSet.has(captions[idx].index)) continue;
-      const head = chainStart[idx];
-      if (processedChainHeads.has(head)) continue;
-      processedChainHeads.add(head);
-
-      const tail = chainEnd[head];
-
-      // Only include non-deleted captions so concat text matches word count
-      const capEntries = [];
-      for (let k = head; k <= tail; k++) {
-        const cap = captions[k];
-        const resolvedText = resolveText(cap, suggestionsMap.get(cap.index));
-        if (resolvedText && resolvedText.trim()) capEntries.push({ cap, text: resolvedText });
-      }
-      if (capEntries.length === 0) continue;
-
-      const concatText = capEntries.map(e => e.text).join(' ');
-
-      let leftMs = null, rightMs = null;
-      for (let j = head - 1; j >= 0; j--) {
-        if (!isChangedSet.has(captions[j].index)) { leftMs = captions[j].end_ms; break; }
-      }
-      for (let j = tail + 1; j < captions.length; j++) {
-        if (!isChangedSet.has(captions[j].index)) { rightMs = captions[j].start_ms; break; }
-      }
-      const windowStart = Math.max(0, leftMs !== null ? leftMs - BOUNDARY_BUFFER_MS : (captions[head].start_ms || 0) - 1000);
-      const windowEnd = rightMs !== null ? rightMs + BOUNDARY_BUFFER_MS : ((captions[tail].end_ms || 0) + 1000);
-
-      chainTextMap.set(head, {
-        text: concatText,
-        startMs: windowStart,
-        endMs: windowEnd,
-        capEntries,
-        rightBoundary: rightMs,
-        arrayIdx: chainArrayIdx++
-      });
-    }
-
-    const textForAlignment = [...chainTextMap.values()].map(chain => ({
-      index: chain.arrayIdx,
-      text: chain.text,
-      start_ms: chain.startMs,
-      end_ms: chain.endMs
-    }));
-
     const whisperxURL = process.env.WHISPERX_URL;
     if (!whisperxURL) {
       console.warn('WHISPERX_URL not configured, returning accepted text with original timing');
@@ -455,92 +381,80 @@ ${JSON.stringify(captions.map(c => {
     const whisperxStartTime = Date.now();
 
     try {
-      const whisperxResponse = await fetch(`${whisperxURL}/align`, {
+      console.log(`[/api/refine] Sending audio to WhisperX for full transcription (${audioBuffer.length} bytes)...`);
+
+      const whisperxResponse = await fetch(`${whisperxURL}/transcribe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Secret': process.env.SHARED_SECRET },
         body: JSON.stringify({
           audio_base64: audioBase64,
           audio_format: audioFormat,
-          captions: textForAlignment,
-          language: 'en'
         }),
-        timeout: 120000
+        timeout: 300000
       });
 
       if (!whisperxResponse.ok) {
         whisperxError = `WhisperX error: ${whisperxResponse.status}`;
         console.warn(whisperxError);
       } else {
-        whisperxResult = await whisperxResponse.json();
-        console.log(`[/api/refine] WhisperX returned word timing for ${whisperxResult.captions?.length || 0} chain(s)`);
+        const rawText = await whisperxResponse.text();
+        console.log(`[/api/refine] WhisperX raw response received (${rawText.length} bytes)`);
+        try {
+          whisperxResult = JSON.parse(rawText.trim());
+          console.log(`[/api/refine] WhisperX transcribed ${whisperxResult.words?.length || 0} words`);
+        } catch (e) {
+          whisperxError = `Failed to parse WhisperX JSON: ${e.message}`;
+          console.warn(whisperxError, rawText.slice(0, 100));
+        }
       }
     } catch (err) {
-      whisperxError = `WhisperX unreachable: ${err.message}`;
+      whisperxError = `WhisperX unreachable or timeout: ${err.message}`;
       console.warn(whisperxError);
     }
 
-    stages.whisperx = {
-      duration_ms: Date.now() - whisperxStartTime,
-      status: whisperxError ? 'failed' : 'success',
-      error: whisperxError
-    };
+    // Match all captions to transcript via sequence alignment
+    const assignedTiming = new Map();
+    let matchResults = [];
 
-    // Walk word-level WhisperX results and assign per-caption timing.
-    // Each chain was one concatenated segment; we distribute words to captions
-    // by token count. Caption N ends where caption N+1 starts (no internal gaps).
-    // Last chain caption extends to the next unchanged caption's start.
-    const chainAssignedTiming = new Map(); // capIndex → {startMs, endMs} | null (Stage 1 fallback)
+    if (whisperxResult && Array.isArray(whisperxResult.words)) {
+      const whisperWords = whisperxResult.words.filter(w => w.start_ms != null && w.end_ms != null);
+      console.log(`[/api/refine] Matching ${captions.length} captions to ${whisperWords.length} transcript words...`);
+      matchResults = matchCaptionsToTranscript(captions, whisperWords);
 
-    if (whisperxResult && Array.isArray(whisperxResult.captions)) {
-      const whisperxChains = new Map(whisperxResult.captions.map(c => [c.index, c.words || []]));
-
-      for (const chain of chainTextMap.values()) {
-        const words = whisperxChains.get(chain.arrayIdx) || [];
-
-        if (words.length === 0) {
-          for (const { cap } of chain.capEntries) chainAssignedTiming.set(cap.index, null);
-          continue;
-        }
-
-        let wordPos = 0;
-        const capWordBuckets = [];
-        for (const { cap, text } of chain.capEntries) {
-          const tokens = tokenize(text);
-          const numTokens = Math.max(tokens.length, 1);
-          const capWords = words.slice(wordPos, wordPos + numTokens);
-          wordPos += numTokens;
-          // Subtract a small offset from word starts: wav2vec2 anchors to vowel/energy
-          // onset rather than consonant onset, so start_ms is typically 80-120ms late.
-          // This corrects within-chain transitions (caption N end = caption N+1 start_ms)
-          // which otherwise stay on screen through the early consonants of the next caption.
-          const WORD_START_OFFSET_MS = 100;
-          capWordBuckets.push(capWords.length > 0
-            ? { capIndex: cap.index, startMs: Math.max(0, capWords[0].start_ms - WORD_START_OFFSET_MS), endWords: capWords[capWords.length - 1].end_ms }
-            : null);
-        }
-
-        for (let k = 0; k < chain.capEntries.length; k++) {
-          const { cap } = chain.capEntries[k];
-          const bucket = capWordBuckets[k];
-          if (!bucket) { chainAssignedTiming.set(cap.index, null); continue; }
-
-          let endMs;
-          if (k < chain.capEntries.length - 1) {
-            const nextBucket = capWordBuckets[k + 1];
-            endMs = nextBucket ? nextBucket.startMs : bucket.endWords;
-          } else {
-            endMs = chain.rightBoundary !== null ? chain.rightBoundary : bucket.endWords;
-          }
-          chainAssignedTiming.set(cap.index, { startMs: bucket.startMs, endMs });
+      let matchedCount = 0;
+      for (let i = 0; i < captions.length; i++) {
+        const match = matchResults[i];
+        if (match) {
+          matchedCount++;
+          assignedTiming.set(captions[i].index, {
+            startMs:      match.startMs,
+            endMs:        match.endMs + 200,  // 200ms natural tail
+            words:        match.words,
+            matchedRatio: match.matchedRatio,
+          });
         }
       }
+      console.log(`[/api/refine] Matched ${matchedCount}/${captions.length} captions (${((matchedCount / captions.length) * 100).toFixed(0)}%)`);
     }
+
+    const missed = captions
+      .filter((_, i) => !matchResults[i])
+      .map(c => c.index);
+
+    stages.whisperx = {
+      duration_ms:       Date.now() - whisperxStartTime,
+      status:            whisperxError ? 'failed' : 'success',
+      error:             whisperxError,
+      words_transcribed: whisperxResult?.words?.length || 0,
+      matched:           captions.length - missed.length,
+      missed_segments:   whisperxError ? [] : missed,
+    };
 
     const mergedCaptions = _mergeCaptionSuggestions(
       captions,
       acceptedSuggestions,
       !!whisperxError,
-      chainAssignedTiming
+      assignedTiming
     );
 
     // Gemini-only version: accepted text + Stage 1 timing (no WhisperX changes).
@@ -572,10 +486,8 @@ ${JSON.stringify(captions.map(c => {
   }
 });
 
-// Helper: Merge accepted suggestions + chain-assigned WhisperX timing into original captions.
-// chainAssignedTiming: Map<capIndex, {startMs, endMs}> built by walking word-level
-// results from single-segment chain alignment. Absent entry = Stage 1 fallback.
-function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, chainAssignedTiming = new Map()) {
+// Helper: Merge accepted suggestions + assigned WhisperX timing into original captions.
+function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assignedTiming = new Map()) {
   const suggestionsMap = new Map(suggestions.map(s => [s.caption_index, s]));
 
   const merged = originalCaptions.map(cap => {
@@ -593,20 +505,17 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, chai
       newText = cap.text;
     }
 
-    // Timing: use chain-assigned word-boundary timing for changed/flagged captions.
-    // null entry = WhisperX failed for this chain → keep Stage 1 timing.
-    // Unchanged captions always keep Stage 1 timing.
     let startMs = cap.start_ms;
     let endMs = cap.end_ms;
-    const hasTimingNeeds = cap.timingFlag && cap.timingFlag.startsWith('Timing needs');
-    const shouldAlign = isChanged || hasTimingNeeds;
-    if (shouldAlign) {
-      const assigned = chainAssignedTiming.get(cap.index);
-      if (assigned) {
-        startMs = assigned.startMs;
-        endMs = assigned.endMs;
+    let timingWasChanged = false;
+
+    const assigned = assignedTiming.get(cap.index);
+    if (assigned) {
+      if (Math.abs(assigned.startMs - startMs) > 10 || Math.abs(assigned.endMs - endMs) > 10) {
+        timingWasChanged = true;
       }
-      // else: no entry = WhisperX failed for this chain → keep Stage 1 timing
+      startMs = assigned.startMs;
+      endMs = assigned.endMs;
     }
 
     return {
@@ -620,7 +529,10 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, chai
       reason: isChanged ? suggestion.reason : null,
       original_text: cap.text,
       timing_flag: cap.timingFlag || null,
-      partial: isPartial
+      timing_changed:  timingWasChanged,
+      partial:         isPartial,
+      words:           assigned ? assigned.words        : null,
+      matched_ratio:   assigned ? assigned.matchedRatio : null,
     };
   });
 
@@ -656,28 +568,24 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, chai
     surviving = surviving.filter((_, i) => !dedupFlags[i]);
   }
 
-  // Clamp overlaps — preserve original text order, never sort by timestamp.
-  for (let i = 1; i < surviving.length; i++) {
-    if (surviving[i].start_ms < surviving[i - 1].end_ms) {
-      surviving[i].start_ms = surviving[i - 1].end_ms;
+
+  // Ensure 240ms minimum duration and resolve overlaps by trimming ends only.
+  // Never move start_ms — it is the matched word boundary from the transcript.
+  const MIN_DURATION_MS = 240;
+  for (let i = 0; i < surviving.length; i++) {
+    const c = surviving[i];
+    if (c.end_ms < c.start_ms + MIN_DURATION_MS) {
+      c.end_ms = c.start_ms + MIN_DURATION_MS;
     }
-    if (surviving[i].end_ms <= surviving[i].start_ms) {
-      surviving[i].end_ms = surviving[i].start_ms + 500;
+    if (i > 0) {
+      const prev = surviving[i - 1];
+      if (prev.end_ms > c.start_ms) {
+        prev.end_ms = Math.max(prev.start_ms + MIN_DURATION_MS, c.start_ms);
+      }
     }
   }
 
-  // Snap-to-next: close small gaps (< 500ms) between adjacent captions.
-  // Within-chain gaps are already eliminated by the word-boundary assignment above;
-  // this handles residual gaps at chain/unchanged boundaries and Stage 1 captions.
-  const SNAP_THRESHOLD_MS = 500;
-  for (let i = 0; i < surviving.length - 1; i++) {
-    const gap = surviving[i + 1].start_ms - surviving[i].end_ms;
-    if (gap > 0 && gap < SNAP_THRESHOLD_MS) {
-      surviving[i].end_ms = surviving[i + 1].start_ms;
-    }
-  }
-
-  return surviving.map((c, i) => ({ ...c, index: i + 1 }));
+  return surviving;
 }
 
 app.get('/', (req, res) => res.send('ABC Caption Proxy — OK'));
