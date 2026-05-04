@@ -91,7 +91,7 @@ No preamble. No markdown. Raw JSON array only.`;
     };
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -198,6 +198,7 @@ Never suggest changes that would merge text across italic/non-italic boundaries.
 
 SPLIT IS A LAST RESORT:
 Only use change_type "split" when you cannot move words to a neighboring caption because the name tag rule or italic boundary rule blocks redistribution AND the caption is genuinely too long. For all other cases — including "end-of-one-thought + start-of-another" — use phrase_break or merge to shift the boundary between existing captions instead.
+NOTE: this last-resort rule does NOT apply to captions flagged with line_too_long: true — those must always be fixed. Prefer redistribution to a neighbour first; use a split only when redistribution is blocked by the name tag or italic boundary rules. But do something: leaving a line_too_long caption unchanged is never acceptable.
 
 DO NOT CHANGE:
 - The actual words spoken (ZERO text loss!)
@@ -215,6 +216,7 @@ For each change, specify:
 - split_remainder: (splits only) the second half of the text — the formatter inserts this as a new caption immediately after
 
 For a split: set new_text to the first half and split_remainder to the second half. Return ONE entry only — do not also create a separate entry for the following caption.
+SPLIT + ABSORB: if your split's new_text and split_remainder together contain all the words of an adjacent caption (i.e. you moved its text into the split to get enough characters), you MUST return a separate entry for that absorbed caption with new_text: "" and change_type: "delete". Failing to do so leaves a duplicate caption in the output.
 
 LINE LENGTH RULE:
 Each caption is displayed on up to 2 lines, max 30 characters per line (60 total for normal captions).
@@ -268,7 +270,7 @@ ${JSON.stringify(captions.map(c => {
             { text: geminiPrompt }
           ]
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 12000 },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 65536, thinkingConfig: { thinkingBudget: 0 } },
         safetySettings: [
           { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
           { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
@@ -278,7 +280,7 @@ ${JSON.stringify(captions.map(c => {
       };
 
       // Try models in order, falling back on 503/UNAVAILABLE
-      const geminiModels = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+      const geminiModels = ['gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.0-flash'];
       let geminiResponse, geminiData;
       for (let attempt = 0; attempt < geminiModels.length; attempt++) {
         const model = geminiModels[attempt];
@@ -380,7 +382,7 @@ ${JSON.stringify(captions.map(c => {
     const whisperxURL = process.env.WHISPERX_URL;
     if (!whisperxURL) {
       console.warn('WHISPERX_URL not configured, returning accepted text with original timing');
-      const fallbackResult = _mergeCaptionSuggestions(captions, acceptedSuggestions, true, new Map(), new Set());
+      const fallbackResult = _mergeCaptionSuggestions(captions, acceptedSuggestions, true, new Map(), new Set(), new Map());
       return res.json({
         status: 'partial',
         error: 'WhisperX not configured — using accepted text with original timing',
@@ -446,37 +448,50 @@ ${JSON.stringify(captions.map(c => {
 
     // Match all captions to transcript via sequence alignment
     const assignedTiming = new Map();
+    const splitRemainderTiming = new Map();
     let matchResults = [];
 
     if (whisperxResult && Array.isArray(whisperxResult.words)) {
       const whisperWords = whisperxResult.words.filter(w => w.start_ms != null && w.end_ms != null);
       
-      // Use refined Gemini text for matching (otherwise alignment fails on changed text)
+      // Use refined Gemini text for matching (otherwise alignment fails on changed text).
+      // Split remainders are injected immediately after their parent so they get real timing too.
       const suggestionsMap = new Map(acceptedSuggestions.map(s => [s.caption_index, s]));
-      const captionsForMatching = captions.map(cap => {
+      const captionsForMatching = [];
+      const matchingMeta = []; // {type:'main'|'remainder', capIndex} parallel to captionsForMatching
+      for (const cap of captions) {
         const sugg = suggestionsMap.get(cap.index);
         if (sugg) {
           const isDelete = sugg.change_type === 'delete' || !sugg.new_text || sugg.new_text.trim() === '';
-          return { ...cap, text: isDelete ? '' : sugg.new_text };
+          captionsForMatching.push({ ...cap, text: isDelete ? '' : sugg.new_text });
+          matchingMeta.push({ type: 'main', capIndex: cap.index });
+          if (sugg.change_type === 'split' && sugg.split_remainder?.trim()) {
+            captionsForMatching.push({ ...cap, text: sugg.split_remainder.trim() });
+            matchingMeta.push({ type: 'remainder', capIndex: cap.index });
+          }
+        } else {
+          captionsForMatching.push(cap);
+          matchingMeta.push({ type: 'main', capIndex: cap.index });
         }
-        return cap;
-      });
+      }
 
-      console.log(`[/api/refine] Matching ${captionsForMatching.length} captions to ${whisperWords.length} transcript words...`);
+      const remainderCount = captionsForMatching.length - captions.length;
+      console.log(`[/api/refine] Matching ${captions.length} captions (+${remainderCount} split remainders) to ${whisperWords.length} transcript words...`);
       matchResults = matchCaptionsToTranscript(captionsForMatching, whisperWords);
 
       let matchedCount = 0;
-      for (let i = 0; i < captions.length; i++) {
+      for (let i = 0; i < matchingMeta.length; i++) {
         const match = matchResults[i];
-        if (match) {
-          matchedCount++;
-          assignedTiming.set(captions[i].index, {
-            startMs:      Math.max(0, match.startMs - 100),  // 100ms lead-in before first word
-            endMs:        match.endMs + 200,  // 200ms natural tail
-            words:        match.words,
-            matchedRatio: match.matchedRatio,
-          });
-        }
+        if (!match) continue;
+        const { type, capIndex } = matchingMeta[i];
+        const timing = {
+          startMs:      Math.max(0, match.startMs - 150),
+          endMs:        match.endMs + 200,
+          words:        match.words,
+          matchedRatio: match.matchedRatio,
+        };
+        if (type === 'main') { matchedCount++; assignedTiming.set(capIndex, timing); }
+        else                 { splitRemainderTiming.set(capIndex, timing); }
       }
       console.log(`[/api/refine] Matched ${matchedCount}/${captions.length} captions (${((matchedCount / captions.length) * 100).toFixed(0)}%)`);
     }
@@ -498,7 +513,7 @@ ${JSON.stringify(captions.map(c => {
     }
 
     const missed = captions
-      .filter((_, i) => !matchResults[i])
+      .filter(c => !assignedTiming.has(c.index))
       .map(c => c.index);
 
     stages.whisperx = {
@@ -516,7 +531,8 @@ ${JSON.stringify(captions.map(c => {
       acceptedSuggestions,
       !!whisperxError,
       filteredTiming,
-      timingUpdateFailed
+      timingUpdateFailed,
+      whisperxError ? new Map() : splitRemainderTiming
     );
 
     // Gemini-only version: accepted text + Stage 1 timing (no WhisperX changes).
@@ -525,7 +541,8 @@ ${JSON.stringify(captions.map(c => {
       acceptedSuggestions,
       true,
       new Map(),
-      new Set()
+      new Set(),
+      new Map()
     );
 
     console.log(`[/api/refine] Phase 2 complete in ${Date.now() - startTime}ms`);
@@ -550,7 +567,7 @@ ${JSON.stringify(captions.map(c => {
 });
 
 // Helper: Merge accepted suggestions + assigned WhisperX timing into original captions.
-function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assignedTiming = new Map(), timingUpdateFailed = new Set()) {
+function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assignedTiming = new Map(), timingUpdateFailed = new Set(), splitRemainderTiming = new Map()) {
   const MIN_DURATION_MS = 240;
   const suggestionsMap = new Map(suggestions.map(s => [s.caption_index, s]));
 
@@ -601,8 +618,6 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assi
       timing_source:        assigned ? 'whisperx' : 'stage1',
       timing_update_failed: timingUpdateFailed.has(cap.index),
       partial:              isPartial,
-      words:                assigned ? assigned.words        : null,
-      matched_ratio:        assigned ? assigned.matchedRatio : null,
       ...(splitRemainder ? { _splitRemainder: splitRemainder } : {}),
     };
   });
@@ -620,7 +635,10 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assi
   const dedupFlags = new Array(surviving.length).fill(false);
   for (let i = 0; i < surviving.length; i++) {
     if (!surviving[i].changed || dedupFlags[i]) continue;
-    const changedNorm = normalizeForCompare(surviving[i].text);
+    // For splits, include split_remainder so we detect when new_text+remainder
+    // together absorb a neighbouring caption that Gemini forgot to delete.
+    const splitRemNorm = surviving[i]._splitRemainder ? ' ' + normalizeForCompare(surviving[i]._splitRemainder) : '';
+    const changedNorm = normalizeForCompare(surviving[i].text) + splitRemNorm;
     if (changedNorm.length < 4) continue;
     for (let j = i + 1; j <= Math.min(i + DEDUP_WINDOW, surviving.length - 1); j++) {
       if (surviving[j].changed || dedupFlags[j]) continue;
@@ -640,19 +658,20 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assi
   }
 
   // Expand splits: insert remainder caption immediately after the split parent.
-  // The remainder starts where the parent ends; WhisperX didn't match it so it
-  // is flagged timing_update_failed for manual review.
+  // Use WhisperX timing if available; otherwise fall back to a placeholder
+  // starting at the parent's end (flagged timing_update_failed for manual review).
   if (surviving.some(c => c._splitRemainder)) {
     const expanded = [];
     for (const cap of surviving) {
       expanded.push(cap);
       if (cap._splitRemainder) {
+        const remTiming = splitRemainderTiming.get(cap.index);
         expanded.push({
           index:                cap.index + 0.5,
           text:                 cap._splitRemainder,
           italic:               cap.italic,
-          start_ms:             cap.end_ms,
-          end_ms:               cap.end_ms + MIN_DURATION_MS,
+          start_ms:             remTiming ? remTiming.startMs : cap.end_ms,
+          end_ms:               remTiming ? remTiming.endMs   : cap.end_ms + MIN_DURATION_MS,
           changed:              true,
           change_type:          'split',
           reason:               cap.reason,
@@ -660,10 +679,10 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assi
           timing_flag:          null,
           timing_changed:       false,
           timing_source:        'whisperx',
-          timing_update_failed: true,
+          timing_update_failed: !remTiming,
           partial:              isPartial,
-          words:                null,
-          matched_ratio:        null,
+          words:                remTiming ? remTiming.words        : null,
+          matched_ratio:        remTiming ? remTiming.matchedRatio : null,
         });
         delete cap._splitRemainder;
       }
@@ -692,6 +711,13 @@ function _mergeCaptionSuggestions(originalCaptions, suggestions, isPartial, assi
         }
       } else {
         prev.end_ms = Math.max(prev.start_ms + MIN_DURATION_MS, curr.start_ms);
+        // If prev couldn't shrink far enough, push curr forward rather than leaving an overlap.
+        if (prev.end_ms > curr.start_ms) {
+          curr.start_ms = prev.end_ms;
+          if (curr.end_ms < curr.start_ms + MIN_DURATION_MS) {
+            curr.end_ms = curr.start_ms + MIN_DURATION_MS;
+          }
+        }
       }
     }
   }
