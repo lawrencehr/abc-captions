@@ -165,6 +165,9 @@ You will receive audio and a list of captions that have been auto-formatted from
 
 Your job: review the captions against what is actually said in the audio, and suggest improvements where caption breaks fall in awkward places.
 
+HARD CHARACTER LIMIT:
+Every caption entry in the input has a chars field (current spoken-text length) and a max_chars field (the limit that applies — 60 for normal captions, 30 for name-tag captions where only the second line is available for spoken text). Before finalising any suggestion, verify new_text does not exceed max_chars. If it does, try a different redistribution or split — never return a suggestion whose new_text or split_remainder exceeds 60 characters. If no valid fix exists within the limit, return NO suggestion for that caption. Returning oversized text is never acceptable.
+
 QUALITY THRESHOLD:
 Suggest changes only where a caption break is clearly awkward — a hard cut mid-phrase, a name split across captions, a short caption that genuinely disrupts flow, or a boundary that lands in the wrong place relative to how the speaker pauses. The bar should be high: leave a caption alone if it reads naturally as a standalone phrase, even if a slightly different arrangement might be marginally better. A marginally better phrasing is not enough. Aim for targeted fixes, not an editorial pass.
 
@@ -172,7 +175,7 @@ THE GOLDEN RULE: ZERO TEXT LOSS
 You MUST NOT edit, rephrase, or omit any words from the original captions. Your only task is to move the boundaries (the breaks) between captions. Every word in the input must appear exactly once in your output. No words can be added, and NO words can be deleted unless the entire caption is being merged into another.
 
 PRIORITISE:
-- Captions with a timing_flag field — their text has been moved by the Stage 1 formatter so boundaries are known to be wrong. Suggest the boundary placement that best fits the audio even if the text looks readable as-is.
+- Captions with a timing_flag field — their text has been moved by the Stage 1 formatter so boundaries are known to be wrong. If you want to move words between this caption and a neighbour to better fit the audio, return a suggestion. If the text already reads naturally and you are not moving any words, return NO suggestion — timing for flagged captions is updated automatically, so a "timing only" suggestion is unnecessary and will be discarded.
 - Short captions (e.g. 1-3 words, flagged with is_short) — merge these with neighbors to improve flow unless they are name tags, or consist of a single emphatic word with an unmistakable audio pause both before and after.
 - Captions where a person's name is split across two captions
 - Caption breaks that fall mid-phrase or mid-thought when the audio has a natural pause elsewhere
@@ -210,7 +213,7 @@ OUTPUT FORMAT:
 Return ONLY a JSON array. No preamble. No markdown. If no changes needed, return [].
 For each change, specify:
 - caption_index: the 1-based index from the input
-- new_text: the suggested replacement text (or "" if deleted)
+- new_text: the suggested replacement text (or "" if deleted) — MUST NOT exceed 60 characters
 - change_type: "phrase_break" | "name_kept_together" | "split" | "merge" | "delete"
 - reason: 1-sentence explanation
 - split_remainder: (splits only) the second half of the text — the formatter inserts this as a new caption immediately after
@@ -224,7 +227,7 @@ Captions with a speaker name tag (e.g. "JOHN SMITH:") always use the first line 
 - For these, you MUST fit the spoken text within the provided effective_max_chars (always 30 — only line 2 is available for spoken text).
 - If a caption is flagged with line_too_long: true, you MUST fix the overflow.
 - If you cannot move words to a neighbor (because of name tags or italic boundaries), you MUST SPLIT the caption using change_type "split" with new_text as the first half and split_remainder as the second half.
-- NO suggested caption should ever exceed 60 characters total.
+- HARD LIMIT: new_text MUST NOT exceed 60 characters. split_remainder MUST NOT exceed 60 characters. If you cannot achieve this without violating the no-text-loss rule or the name tag / italic boundary rules, return NO suggestion for that caption — do not return an oversized suggestion.
 Write new_text as a flat string with NO line breaks — the formatter will split it automatically.
 
 INPUT CAPTIONS:
@@ -258,7 +261,8 @@ ${JSON.stringify(captions.map(c => {
     };
     if (lineTooLong) {
       entry.line_too_long = true;
-      entry.effective_max_chars = effectiveMax;
+      entry.chars = spokenText.length;
+      entry.max_chars = effectiveMax;
     }
     return entry;
 }), null, 2)}`;
