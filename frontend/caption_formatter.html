@@ -7060,8 +7060,8 @@ function initEasterEgg() {
 }
 
 function showEasterEgg() {
-  // Easter egg disabled (e.g. for demos). Flip to true to re-enable.
-  const EASTER_EGG_ENABLED = false;
+  // Flip to false to suppress the overlay (e.g. for demos).
+  const EASTER_EGG_ENABLED = true;
   if (!EASTER_EGG_ENABLED) return;
   const el = document.getElementById('easter-egg');
   if (!el) return;
