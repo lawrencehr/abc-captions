@@ -85,7 +85,7 @@ Render Proxy  backend/server.js
 - Phase 1 (`POST /api/refine` without `accepted_suggestions`): Gemini analyses captions (text only — audio is uploaded but NOT sent to Gemini; A/B testing showed it changes output no more than run-to-run variance), returns JSON array of suggested boundary changes. The prompt is LINE-LEVEL: Gemini writes `new_text` as 1–2 explicit `\n`-separated lines of ≤30 chars (name tag alone on line 1) — A/B tested: flat 60-char texts rendered a >30 line ~10% of the time, line-level 0%. Suggestions pass through the oversize filter then chain validation (`validateSuggestionChains` — drops chains that lose/duplicate words, cross italic boundaries, have dangling links, or break the strict 30-char line rule; Premiere force-wraps at 30 so overflow is silently hidden). Browser shows diff view; `mapApiCaption` uses Gemini's line breaks verbatim (`splitLines` only for flat text).
 - Phase 2 (`POST /api/refine` with `accepted_suggestions`): Backend applies accepted suggestions, then calls WhisperX `/transcribe` (single call for full audio), uses `matcher.js` to map captions to transcript words, and returns millisecond timestamps. Browser shows Align Preview.
 
-**Gemini model fallback:** tries `gemini-3.5-flash` → `gemini-3-flash-preview` → `gemini-2.5-flash` → `gemini-2.0-flash` in order, retrying on `UNAVAILABLE` or `RESOURCE_EXHAUSTED`.
+**Gemini model fallback:** tries `gemini-3.8-flash` → `gemini-3.7-flash` → `gemini-3.6-flash` → `gemini-3.5-flash-lite` in order, retrying on `UNAVAILABLE` or `RESOURCE_EXHAUSTED`.
 
 **Keep-alive:** backend writes space bytes every 10s during long API calls to prevent Render's 100s idle timeout from cutting the connection.
 

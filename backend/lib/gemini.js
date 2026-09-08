@@ -2,7 +2,7 @@
 // Used by backend/server.js (production) and test_system/gemini_eval (offline eval)
 // so the prompt, generationConfig, parsing and filtering can never drift apart.
 
-const GEMINI_MODELS = ['gemini-3.5-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite'];
 
 // Gemini 3.x: temperature / top_p / top_k are no longer recommended; the
 // model picks them internally. Use thinkingLevel (string) instead of the

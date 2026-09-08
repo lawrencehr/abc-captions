@@ -97,11 +97,11 @@ No preamble. No markdown. Raw JSON array only.`;
       }],
       // Gemini 3.x: temperature/top_p/top_k are no longer recommended; use
       // thinkingLevel instead. "low" keeps it fast for this structured task.
-      generationConfig: geminiConfigFor('gemini-3.5-flash')
+      generationConfig: geminiConfigFor(GEMINI_MODELS[0])
     };
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODELS[0]}:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -192,7 +192,7 @@ app.post('/api/refine', async (req, res) => {
       };
 
       // Try models in order, falling back on 503/UNAVAILABLE.
-      // gemini-3.5-flash is the new stable flagship (announced at I/O 2026).
+      // gemini-3.8-flash is the current flagship; older 3.x releases follow.
       // generationConfig is built per-model — 3.x uses thinkingLevel, 2.x uses temperature.
       const geminiModels = GEMINI_MODELS;
       let geminiResponse, geminiData;
